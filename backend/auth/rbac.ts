@@ -1,52 +1,41 @@
-export type Role = 'admin' | 'operator' | 'viewer';
-
 export interface User {
   id: string;
-  role: Role;
-  permissions: string[];
+  role: 'admin' | 'operator' | 'viewer';
 }
 
-export const PERMISSIONS = {
-  RESOURCES_READ: 'resources:read',
-  RESOURCES_WRITE: 'resources:write',
-  RESOURCES_DELETE: 'resources:delete',
-  BULK_IMPORT: 'bulk:import'
-} as const;
+export interface Permission {
+  resource: string;
+  action: 'create' | 'read' | 'update' | 'delete' | 'bulk';
+}
 
-export const ROLE_PERMISSIONS: Record<Role, string[]> = {
+const ROLE_PERMISSIONS: Record<string, Permission[]> = {
   admin: [
-    PERMISSIONS.RESOURCES_READ,
-    PERMISSIONS.RESOURCES_WRITE,
-    PERMISSIONS.RESOURCES_DELETE,
-    PERMISSIONS.BULK_IMPORT
+    { resource: '*', action: 'create' },
+    { resource: '*', action: 'read' },
+    { resource: '*', action: 'update' },
+    { resource: '*', action: 'delete' },
+    { resource: '*', action: 'bulk' }
   ],
   operator: [
-    PERMISSIONS.RESOURCES_READ,
-    PERMISSIONS.RESOURCES_WRITE,
-    PERMISSIONS.BULK_IMPORT
+    { resource: '*', action: 'create' },
+    { resource: '*', action: 'read' },
+    { resource: '*', action: 'update' },
+    { resource: '*', action: 'bulk' }
   ],
   viewer: [
-    PERMISSIONS.RESOURCES_READ
+    { resource: '*', action: 'read' }
   ]
 };
 
-export function hasPermission(user: User, permission: string): boolean {
-  return user.permissions.includes(permission);
+export function hasPermission(user: User, resource: string, action: Permission['action']): boolean {
+  const permissions = ROLE_PERMISSIONS[user.role] || [];
+  return permissions.some(p => 
+    (p.resource === '*' || p.resource === resource) && p.action === action
+  );
 }
 
-export function getUserFromEvent(event: any): User {
-  const role = event.requestContext?.authorizer?.role || 'viewer';
-  const userId = event.requestContext?.authorizer?.userId || 'anonymous';
-  
-  return {
-    id: userId,
-    role: role as Role,
-    permissions: ROLE_PERMISSIONS[role as Role] || ROLE_PERMISSIONS.viewer
-  };
-}
-
-export function checkPermission(user: User, permission: string): void {
-  if (!hasPermission(user, permission)) {
-    throw new Error(`Insufficient permissions. Required: ${permission}`);
+export function requirePermission(user: User, resource: string, action: Permission['action']): void {
+  if (!hasPermission(user, resource, action)) {
+    throw new Error(`Insufficient permissions for ${action} on ${resource}`);
   }
 }
