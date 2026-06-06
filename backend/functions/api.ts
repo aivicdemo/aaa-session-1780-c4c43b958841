@@ -1,39 +1,27 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, BatchWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, ScanCommand, PutCommand, BatchWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { hasPermission, createUser, PERMISSIONS } from './rbac';
+import { getUserFromEvent, checkPermission, PERMISSIONS, User } from './rbac';
 import { randomUUID } from 'crypto';
 
 const client = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(client);
-const TABLE_NAME = process.env.MAIN_TABLE || 'production-management';
+const TABLE_NAME = process.env.MAIN_TABLE!;
 
-interface ResourceConfig {
-  entityType: string;
-  readPermission: string;
-  writePermission: string;
-  deletePermission: string;
-  idField: string;
+interface ErrorResponse {
+  error: string;
+  message: string;
 }
 
-const RESOURCE_CONFIGS: Record<string, ResourceConfig> = {
-  '0': { entityType: 'USER', readPermission: PERMISSIONS.READ_USERS, writePermission: PERMISSIONS.WRITE_USERS, deletePermission: PERMISSIONS.DELETE_USERS, idField: 'userId' },
-  '1': { entityType: 'PRODUCT', readPermission: PERMISSIONS.READ_PRODUCTS, writePermission: PERMISSIONS.WRITE_PRODUCTS, deletePermission: PERMISSIONS.DELETE_PRODUCTS, idField: 'productId' },
-  '2': { entityType: 'SPECIFICATION', readPermission: PERMISSIONS.READ_SPECIFICATIONS, writePermission: PERMISSIONS.WRITE_SPECIFICATIONS, deletePermission: PERMISSIONS.DELETE_SPECIFICATIONS, idField: 'specificationId' },
-  '3': { entityType: 'PROCESS', readPermission: PERMISSIONS.READ_PROCESSES, writePermission: PERMISSIONS.WRITE_PROCESSES, deletePermission: PERMISSIONS.DELETE_PROCESSES, idField: 'processId' },
-  '4': { entityType: 'LINE', readPermission: PERMISSIONS.READ_LINES, writePermission: PERMISSIONS.WRITE_LINES, deletePermission: PERMISSIONS.DELETE_LINES, idField: 'lineId' },
-  '5': { entityType: 'MATERIAL', readPermission: PERMISSIONS.READ_MATERIALS, writePermission: PERMISSIONS.WRITE_MATERIALS, deletePermission: PERMISSIONS.DELETE_MATERIALS, idField: 'materialId' },
-  '6': { entityType: 'PRODUCTION_PLAN', readPermission: PERMISSIONS.READ_PRODUCTION_PLANS, writePermission: PERMISSIONS.WRITE_PRODUCTION_PLANS, deletePermission: PERMISSIONS.DELETE_PRODUCTION_PLANS, idField: 'productionPlanId' },
-  '7': { entityType: 'WORK_ORDER', readPermission: PERMISSIONS.READ_WORK_ORDERS, writePermission: PERMISSIONS.WRITE_WORK_ORDERS, deletePermission: PERMISSIONS.DELETE_WORK_ORDERS, idField: 'workOrderId' },
-  '8': { entityType: 'WORK_RESULT', readPermission: PERMISSIONS.READ_WORK_RESULTS, writePermission: PERMISSIONS.WRITE_WORK_RESULTS, deletePermission: PERMISSIONS.DELETE_WORK_RESULTS, idField: 'workResultId' },
-  '9': { entityType: 'QUALITY_RESULT', readPermission: PERMISSIONS.READ_QUALITY_RESULTS, writePermission: PERMISSIONS.WRITE_QUALITY_RESULTS, deletePermission: PERMISSIONS.DELETE_QUALITY_RESULTS, idField: 'qualityResultId' },
-  '10': { entityType: 'PROGRESS', readPermission: PERMISSIONS.READ_PROGRESS, writePermission: PERMISSIONS.WRITE_PROGRESS, deletePermission: PERMISSIONS.DELETE_PROGRESS, idField: 'progressId' },
-  '11': { entityType: 'PROCEDURE', readPermission: PERMISSIONS.READ_PROCEDURES, writePermission: PERMISSIONS.WRITE_PROCEDURES, deletePermission: PERMISSIONS.DELETE_PROCEDURES, idField: 'procedureId' },
-  '12': { entityType: 'QUALITY_STANDARD', readPermission: PERMISSIONS.READ_QUALITY_STANDARDS, writePermission: PERMISSIONS.WRITE_QUALITY_STANDARDS, deletePermission: PERMISSIONS.DELETE_QUALITY_STANDARDS, idField: 'qualityStandardId' },
-  '13': { entityType: 'WORK_HISTORY', readPermission: PERMISSIONS.READ_WORK_HISTORY, writePermission: PERMISSIONS.WRITE_WORK_HISTORY, deletePermission: PERMISSIONS.DELETE_WORK_HISTORY, idField: 'workHistoryId' },
-  '14': { entityType: 'ANOMALY_LOG', readPermission: PERMISSIONS.READ_ANOMALY_LOGS, writePermission: PERMISSIONS.WRITE_ANOMALY_LOGS, deletePermission: PERMISSIONS.DELETE_ANOMALY_LOGS, idField: 'anomalyId' },
-  '15': { entityType: 'ALERT_HISTORY', readPermission: PERMISSIONS.READ_ALERT_HISTORY, writePermission: PERMISSIONS.WRITE_ALERT_HISTORY, deletePermission: PERMISSIONS.DELETE_ALERT_HISTORY, idField: 'alertHistoryId' }
-};
+interface BulkImportRequest {
+  items: Record<string, unknown>[];
+}
+
+interface BulkImportResponse {
+  imported: number;
+  failed: number;
+  errors: string[];
+}
 
 function createResponse(statusCode: number, body: any): APIGatewayProxyResult {
   return {
@@ -48,285 +36,174 @@ function createResponse(statusCode: number, body: any): APIGatewayProxyResult {
   };
 }
 
-function getUserFromEvent(event: APIGatewayProxyEvent) {
-  const authHeader = event.headers.Authorization || event.headers.authorization;
-  if (!authHeader) {
-    throw new Error('Authorization header missing');
-  }
-  
-  const token = authHeader.replace('Bearer ', '');
-  const [userId, role] = token.split(':');
-  
-  if (!userId || !role || !['admin', 'operator', 'viewer'].includes(role)) {
-    throw new Error('Invalid token format');
-  }
-  
-  return createUser(userId, role as 'admin' | 'operator' | 'viewer');
+function createErrorResponse(statusCode: number, error: string, message: string): APIGatewayProxyResult {
+  const errorResponse: ErrorResponse = { error, message };
+  return createResponse(statusCode, errorResponse);
 }
 
-async function writeAuditLog(action: string, entityType: string, entityId: string, userId: string, details?: any) {
+async function createAuditLog(user: User, action: string, details: any): Promise<void> {
   const auditLog = {
     pk: 'AUDIT',
     sk: `${Date.now()}_${randomUUID()}`,
+    userId: user.id,
+    userRole: user.role,
     action,
-    entityType,
-    entityId,
-    userId,
-    timestamp: new Date().toISOString(),
-    details: details || {}
+    details,
+    timestamp: new Date().toISOString()
   };
-  
+
   await docClient.send(new PutCommand({
     TableName: TABLE_NAME,
     Item: auditLog
   }));
 }
 
+async function getResources(user: User): Promise<APIGatewayProxyResult> {
+  try {
+    checkPermission(user, PERMISSIONS.RESOURCES_READ);
+
+    const command = new ScanCommand({
+      TableName: TABLE_NAME,
+      FilterExpression: 'pk <> :auditPk',
+      ExpressionAttributeValues: {
+        ':auditPk': 'AUDIT'
+      }
+    });
+
+    const result = await docClient.send(command);
+    return createResponse(200, {
+      items: result.Items || [],
+      count: result.Count || 0
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('Insufficient permissions')) {
+      return createErrorResponse(403, 'Forbidden', error.message);
+    }
+    console.error('Error getting resources:', error);
+    return createErrorResponse(500, 'Internal Server Error', 'Failed to retrieve resources');
+  }
+}
+
+async function bulkImport(user: User, tableIndex: string, items: Record<string, unknown>[]): Promise<APIGatewayProxyResult> {
+  try {
+    checkPermission(user, PERMISSIONS.BULK_IMPORT);
+
+    if (!items || !Array.isArray(items)) {
+      return createErrorResponse(400, 'Bad Request', 'Items must be an array');
+    }
+
+    if (items.length === 0) {
+      return createResponse(200, { imported: 0, failed: 0, errors: [] });
+    }
+
+    const now = new Date().toISOString();
+    const processedItems = items.map(item => ({
+      ...item,
+      id: item.id || randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+      pk: item.pk || `RESOURCE_${tableIndex}`,
+      sk: item.sk || `${Date.now()}_${randomUUID()}`
+    }));
+
+    let imported = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
+    // Process in batches of 25 (DynamoDB BatchWrite limit)
+    for (let i = 0; i < processedItems.length; i += 25) {
+      const batch = processedItems.slice(i, i + 25);
+      
+      try {
+        const putRequests = batch.map(item => ({
+          PutRequest: {
+            Item: item
+          }
+        }));
+
+        const command = new BatchWriteCommand({
+          RequestItems: {
+            [TABLE_NAME]: putRequests
+          }
+        });
+
+        const result = await docClient.send(command);
+        
+        // Handle unprocessed items
+        const unprocessedCount = result.UnprocessedItems?.[TABLE_NAME]?.length || 0;
+        imported += (batch.length - unprocessedCount);
+        failed += unprocessedCount;
+        
+        if (unprocessedCount > 0) {
+          errors.push(`Batch ${Math.floor(i/25) + 1}: ${unprocessedCount} items failed to process`);
+        }
+      } catch (batchError) {
+        failed += batch.length;
+        errors.push(`Batch ${Math.floor(i/25) + 1}: ${batchError instanceof Error ? batchError.message : 'Unknown error'}`);
+      }
+    }
+
+    // Create audit log
+    await createAuditLog(user, 'BULK_IMPORT', {
+      tableIndex,
+      totalItems: items.length,
+      imported,
+      failed
+    });
+
+    const response: BulkImportResponse = {
+      imported,
+      failed,
+      errors
+    };
+
+    return createResponse(200, response);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('Insufficient permissions')) {
+      return createErrorResponse(403, 'Forbidden', error.message);
+    }
+    console.error('Error in bulk import:', error);
+    return createErrorResponse(500, 'Internal Server Error', 'Failed to import items');
+  }
+}
+
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
   try {
-    if (event.httpMethod === 'OPTIONS') {
+    const user = getUserFromEvent(event);
+    const method = event.httpMethod;
+    const path = event.path;
+    const pathParameters = event.pathParameters || {};
+
+    console.log(`Processing ${method} ${path} for user ${user.id} with role ${user.role}`);
+
+    // Handle CORS preflight
+    if (method === 'OPTIONS') {
       return createResponse(200, {});
     }
 
-    const user = getUserFromEvent(event);
-    const path = event.path;
-    const method = event.httpMethod;
-    
-    if (path === '/resources' && method === 'GET') {
-      if (!hasPermission(user, PERMISSIONS.READ_USERS)) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const result = await docClient.send(new ScanCommand({
-        TableName: TABLE_NAME,
-        FilterExpression: 'begins_with(pk, :prefix)',
-        ExpressionAttributeValues: {
-          ':prefix': 'USER'
-        }
-      }));
-      
-      return createResponse(200, { items: result.Items || [] });
+    // Route handling
+    if (method === 'GET' && path === '/resources') {
+      return await getResources(user);
     }
-    
-    const pathMatch = path.match(/^\/api\/(\d+)(?:\/(\w+))?(?:\/(\w+))?$/);
-    if (!pathMatch) {
-      return createResponse(404, { error: 'Resource not found' });
+
+    // Bulk import endpoints
+    const bulkImportMatch = path.match(/^\/api\/(\w+)\/bulk$/);
+    if (method === 'POST' && bulkImportMatch) {
+      const tableIndex = bulkImportMatch[1];
+      let requestBody: BulkImportRequest;
+      
+      try {
+        requestBody = JSON.parse(event.body || '{}');
+      } catch (parseError) {
+        return createErrorResponse(400, 'Bad Request', 'Invalid JSON in request body');
+      }
+
+      return await bulkImport(user, tableIndex, requestBody.items);
     }
-    
-    const [, resourceIndex, resourceId, action] = pathMatch;
-    const config = RESOURCE_CONFIGS[resourceIndex];
-    
-    if (!config) {
-      return createResponse(404, { error: 'Resource not found' });
-    }
-    
-    if (action === 'bulk' && method === 'POST') {
-      if (!hasPermission(user, PERMISSIONS.BULK_IMPORT)) {
-        return createResponse(403, { error: 'Insufficient permissions for bulk import' });
-      }
-      
-      const body = JSON.parse(event.body || '{}');
-      const items = body.items || [];
-      
-      if (!Array.isArray(items)) {
-        return createResponse(400, { error: 'Items must be an array' });
-      }
-      
-      let imported = 0;
-      let failed = 0;
-      const errors: string[] = [];
-      
-      const chunks = [];
-      for (let i = 0; i < items.length; i += 25) {
-        chunks.push(items.slice(i, i + 25));
-      }
-      
-      for (const chunk of chunks) {
-        const writeRequests = chunk.map(item => {
-          const id = item.id || randomUUID();
-          const now = new Date().toISOString();
-          
-          return {
-            PutRequest: {
-              Item: {
-                pk: config.entityType,
-                sk: id,
-                [config.idField]: id,
-                ...item,
-                createdAt: now,
-                updatedAt: now,
-                createdBy: user.id
-              }
-            }
-          };
-        });
-        
-        try {
-          await docClient.send(new BatchWriteCommand({
-            RequestItems: {
-              [TABLE_NAME]: writeRequests
-            }
-          }));
-          imported += chunk.length;
-        } catch (error) {
-          failed += chunk.length;
-          errors.push(`Batch write failed: ${error}`);
-        }
-      }
-      
-      await writeAuditLog('BULK_IMPORT', config.entityType, 'BULK', user.id, { imported, failed });
-      
-      return createResponse(200, { imported, failed, errors });
-    }
-    
-    if (method === 'GET') {
-      if (!hasPermission(user, config.readPermission)) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      if (resourceId) {
-        const result = await docClient.send(new GetCommand({
-          TableName: TABLE_NAME,
-          Key: {
-            pk: config.entityType,
-            sk: resourceId
-          }
-        }));
-        
-        if (!result.Item) {
-          return createResponse(404, { error: 'Resource not found' });
-        }
-        
-        return createResponse(200, result.Item);
-      } else {
-        const result = await docClient.send(new ScanCommand({
-          TableName: TABLE_NAME,
-          FilterExpression: 'pk = :pk',
-          ExpressionAttributeValues: {
-            ':pk': config.entityType
-          }
-        }));
-        
-        return createResponse(200, { items: result.Items || [] });
-      }
-    }
-    
-    if (method === 'POST') {
-      if (!hasPermission(user, config.writePermission)) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const body = JSON.parse(event.body || '{}');
-      const id = randomUUID();
-      const now = new Date().toISOString();
-      
-      const item = {
-        pk: config.entityType,
-        sk: id,
-        [config.idField]: id,
-        ...body,
-        createdAt: now,
-        updatedAt: now,
-        createdBy: user.id
-      };
-      
-      await docClient.send(new PutCommand({
-        TableName: TABLE_NAME,
-        Item: item
-      }));
-      
-      await writeAuditLog('CREATE', config.entityType, id, user.id, body);
-      
-      return createResponse(201, item);
-    }
-    
-    if (method === 'PUT' && resourceId) {
-      if (!hasPermission(user, config.writePermission)) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const body = JSON.parse(event.body || '{}');
-      const now = new Date().toISOString();
-      
-      const existing = await docClient.send(new GetCommand({
-        TableName: TABLE_NAME,
-        Key: {
-          pk: config.entityType,
-          sk: resourceId
-        }
-      }));
-      
-      if (!existing.Item) {
-        return createResponse(404, { error: 'Resource not found' });
-      }
-      
-      const item = {
-        ...existing.Item,
-        ...body,
-        updatedAt: now,
-        updatedBy: user.id
-      };
-      
-      await docClient.send(new PutCommand({
-        TableName: TABLE_NAME,
-        Item: item
-      }));
-      
-      await writeAuditLog('UPDATE', config.entityType, resourceId, user.id, body);
-      
-      return createResponse(200, item);
-    }
-    
-    if (method === 'DELETE' && resourceId) {
-      if (!hasPermission(user, config.deletePermission)) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const existing = await docClient.send(new GetCommand({
-        TableName: TABLE_NAME,
-        Key: {
-          pk: config.entityType,
-          sk: resourceId
-        }
-      }));
-      
-      if (!existing.Item) {
-        return createResponse(404, { error: 'Resource not found' });
-      }
-      
-      await docClient.send(new DeleteCommand({
-        TableName: TABLE_NAME,
-        Key: {
-          pk: config.entityType,
-          sk: resourceId
-        }
-      }));
-      
-      await writeAuditLog('DELETE', config.entityType, resourceId, user.id);
-      
-      return createResponse(200, { message: 'Resource deleted successfully' });
-    }
-    
-    return createResponse(405, { error: 'Method not allowed' });
-    
+
+    return createErrorResponse(404, 'Not Found', `Endpoint ${method} ${path} not found`);
   } catch (error) {
-    console.error('Error:', error);
-    
-    if (error instanceof Error) {
-      if (error.message.includes('Authorization') || error.message.includes('token')) {
-        return createResponse(401, { error: 'Unauthorized' });
-      }
-      if (error.message.includes('permissions')) {
-        return createResponse(403, { error: 'Forbidden' });
-      }
-      if (error.message.includes('not found')) {
-        return createResponse(404, { error: 'Not found' });
-      }
-      if (error.message.includes('validation')) {
-        return createResponse(400, { error: error.message });
-      }
-    }
-    
-    return createResponse(500, { error: 'Internal server error' });
+    console.error('Unhandled error:', error);
+    return createErrorResponse(500, 'Internal Server Error', 'An unexpected error occurred');
   }
 };
